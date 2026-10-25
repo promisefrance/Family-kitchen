@@ -212,6 +212,52 @@ function localSet(key, value) {
   try { localStorage.setItem(key, JSON.stringify(value)); return true; } catch (e) { return false; }
 }
 
+/* ---------- AUTOMATIC WEEK ROLLOVER ----------
+   Checks whether the stored pantry/orders week is behind the real
+   current week (by today's actual date) and, if so, advances them —
+   archiving the outgoing week's orders first, the same as the manual
+   "start new week" action. Safe to call often: once the stored week
+   matches the real week, it's a no-op. Whichever view (parent or kid)
+   happens to load first in a new week performs the rollover, since
+   sharedGet/sharedSet are shared storage, not per-view. */
+let _rolloverInFlight = null;
+async function rolloverWeekIfNeeded() {
+  if (_rolloverInFlight) return _rolloverInFlight;
+  _rolloverInFlight = (async () => {
+    try {
+      const [p, o, h] = await Promise.all([sharedGet("family-pantry"), sharedGet("family-orders"), sharedGet("family-order-history")]);
+      const pantry = p || EMPTY_PANTRY();
+      const orders = o || EMPTY_ORDERS();
+      const history = h || EMPTY_HISTORY();
+
+      const realMonday = mondayOf(new Date());
+      const storedMonday = pantry.weekStart ? mondayOf(pantry.weekStart) : null;
+
+      // Already current (or somehow future-dated) — nothing to do.
+      if (storedMonday && storedMonday.getTime() >= realMonday.getTime()) return null;
+
+      const newWeekLabel = weekLabelForMonday(realMonday);
+      const newWeekStart = toDateStr(realMonday);
+
+      const hadOrders = Object.keys(orders.orders || {}).some(k => orders.orders[k]?.breakfast || orders.orders[k]?.lunch);
+      if (hadOrders) {
+        const entry = { weekLabel: orders.weekLabel, weekStart: orders.weekStart || null, orders: orders.orders, archivedAt: Date.now() };
+        const hNext = { weeks: [entry, ...(history.weeks || [])].slice(0, 26) };
+        await sharedSet("family-order-history", hNext);
+      }
+
+      const newOrders = { weekLabel: newWeekLabel, weekStart: newWeekStart, orders: {} };
+      const newPantry = { ...pantry, weekLabel: newWeekLabel, weekStart: newWeekStart, updatedAt: Date.now() };
+      await sharedSet("family-pantry", newPantry);
+      await sharedSet("family-orders", newOrders);
+      return { pantry: newPantry, orders: newOrders };
+    } finally {
+      _rolloverInFlight = null;
+    }
+  })();
+  return _rolloverInFlight;
+}
+
 /* ---------- ROOT ---------- */
 function App() {
   const [role, setRole] = useState(undefined);
@@ -376,6 +422,7 @@ function ParentApp({ onSwitchUser }) {
   const [cart, setCart] = useState(EMPTY_CART());
 
   const refresh = useCallback(async () => {
+    await rolloverWeekIfNeeded();
     const [p, o, k, s, r, h, c] = await Promise.all([sharedGet("family-pantry"), sharedGet("family-orders"), sharedGet("family-kids"), sharedGet("family-settings"), sharedGet("family-requests"), sharedGet("family-order-history"), sharedGet("family-cart")]);
     let pp = p || EMPTY_PANTRY();
     if (pp.items && pp.items.some(i => i.category === "Sweets")) {
@@ -1027,6 +1074,7 @@ function KidApp({ kidName, onSwitchUser }) {
   const [favorites, setFavorites] = useState([]);
 
   const refresh = useCallback(async () => {
+    await rolloverWeekIfNeeded();
     const [p,o,s] = await Promise.all([sharedGet("family-pantry"), sharedGet("family-orders"), sharedGet("family-settings")]);
     setPantry(p || EMPTY_PANTRY());
     setOrders(o || EMPTY_ORDERS());
@@ -1071,6 +1119,7 @@ function KidApp({ kidName, onSwitchUser }) {
   useEffect(() => {
     (async () => {
       setLastSeenPantry(localGet(`family-lastseen-${kidName}`)?.ts || 0);
+      await rolloverWeekIfNeeded();
       const [p,o,s,f] = await Promise.all([sharedGet("family-pantry"), sharedGet("family-orders"), sharedGet("family-settings"), sharedGet("family-favorites")]);
       const pp = p || EMPTY_PANTRY(), oo = o || EMPTY_ORDERS();
       setPantry(pp); setOrders(oo); setSettings(s || EMPTY_SETTINGS());
